@@ -7,13 +7,13 @@ import mediapipe as mp
 import matplotlib.pyplot as plt
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from scipy.signal import butter, detrend, filtfilt, welch
+from scipy.signal import butter, detrend, hilbert, filtfilt
 
 logger = logging.getLogger(__name__)
 
-# Paths
+# paths
 model_path = os.path.join("data", "face_landmarker.task")
-video_path = r"data\test_videos\ahjnxtiamx.mp4"
+video_path = r"data\train_sample_videos\abarnvbtwb.mp4"
 output_path = "data/annotated.mp4"
 
 # MediaPipe setup
@@ -32,22 +32,25 @@ video_options = FaceLandmarkerOptions(
 
 video_landmarker = FaceLandmarker.create_from_options(video_options)
 
-# Regions to track
+# regions to track
 REGIONS = ["forehead", "left_cheek", "right_cheek", "mid_region"]
 
-# Processing parameters
-WINDOW_SIZE = 30   # frames per window (~1 sec at 30fps)
+# processing parameters
+WINDOW_SIZE = 30   # frames per window 
 STEP_SIZE = 10
-SMOOTH_WINDOW = 3  # smoothing HR
+SMOOTH_WINDOW = 3  # smoothing heart rate
 
 def smooth_hr(hr_list, window=3):
+    """
+    smoothen heart rate
+    """
     if len(hr_list) < window:
         return hr_list
     return np.convolve(hr_list, np.ones(window)/window, mode='valid')
 
 def sliding_window_segments(signal, window_size, step_size):
     if len(signal) <= window_size:
-        return [signal]  # short signals → single segment
+        return [signal]  # short signals, single segment
     segments = []
     for start in range(0, len(signal) - window_size + 1, step_size):
         segments.append(signal[start:start+window_size])
@@ -57,6 +60,9 @@ def normalize_signal(signal):
     return (signal - np.mean(signal)) / np.std(signal)
 
 def bandpass_filter(signal, fps, low=0.7, high=4.0):
+    """
+    use butterworth bandpass to filter through freqs
+    """
     nyquist = 0.5 * fps
     low_cut = low / nyquist
     high_cut = high / nyquist
@@ -64,6 +70,9 @@ def bandpass_filter(signal, fps, low=0.7, high=4.0):
     return filtfilt(b, a, signal)
 
 def calc_heart_rate(signal, fps, hr_min=40, hr_max=180):
+    """
+    extract heart rate using fft
+    """
     fft = np.fft.rfft(signal)
     freqs = np.fft.rfftfreq(len(signal), 1/fps)
     hr_range = (freqs*60 >= hr_min) & (freqs*60 <= hr_max)
@@ -85,6 +94,9 @@ def extract_mean_values(frame, region_pts):
     return mean_bgr[::-1]  # convert BGR → RGB
 
 def get_regions(landmarks, h, w):
+    """
+    get regions from detected face and divide into relevant regions
+    """
     regions = {name: [] for name in REGIONS}
     indices = {
         "left_cheek": [234, 93, 132, 58, 172],
@@ -142,8 +154,71 @@ def compute_signal_quality(segment, fps, rate_band=(0.7, 4.0)):
 
     return metrics
 
+def calc_correlation(lc, rc, window, step):
+    """
+    calculate the region correlation between different face regions
+    using pearson's correlation and sliding window technique
+    lc = left cheek, rc = right cheek, window = window size, step = step per window
+    """
+    correlations = []
+    for i in range(0, len(lc) - window + 1, step):
+        left_cheek = lc[i:i+window]
+        right_cheek = rc[i:i+window]
+
+        if np.std(left_cheek) == 0 or np.std(right_cheek) == 0:
+            continue
+
+        correlations.append(np.corrcoef(left_cheek, right_cheek)[0, 1])
+
+    if len(correlations) == 0:
+        return {
+            "mean_correlation": np.nan,
+            "correlation_variance": np.nan
+        } 
+    
+    return {
+            "mean_correlation": np.mean(correlations),
+            "correlation_variance": np.var(correlations)
+        }
+
+def extract_phase(signal):
+    """
+    extract phases from signal using hilbert's transform
+    """
+    analytic = hilbert(signal)
+    return np.unwrap(np.angle(analytic))
+
+def phase_coherence(sig1, sig2, window, step):
+    """
+    calculate phase coherence between two face regions using hilbert's transform
+    sig1 = signalA, sig2 = sig2, window = window size, step = step
+    """
+
+    phase_1 = extract_phase(sig1)
+    phase_2 = extract_phase(sig2)
+
+    # list of coherences
+    plv_list = []
+
+    for i in range(0, len(phase_1) - window, step):
+        phase_diff = phase_1[i:i+window] - phase_2[i:i+window]
+
+        coherence = np.abs(np.mean(np.exp(1j * phase_diff)))
+        plv_list.append(coherence)
+
+    if len(plv_list) == 0:
+        return {
+            "mean_plv": np.nan,
+            "plv_variance": np.nan
+            }
+    
+    return {
+            "mean_plv": np.mean(plv_list),
+            "plv_variance": np.var(plv_list)
+        }
+    
 def process_video(video_path, landmarker, output_path=None, annotate=True):
-    """Process a video to compute HR from face regions and optionally save annotated video."""
+    """process a video to compute HR from face regions and optionally save annotated video."""
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -225,6 +300,56 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
         green = bandpass_filter(green, fps)
         filtered_signals[name] = green
 
+    # calculate signal correlation between face regions
+    region_corr = {}
+
+    # recalc window and step for correlation, window is too small
+    CORR_WINDOW = int(2.5 * fps)
+    CORR_STEP = int(1.0 * fps)
+
+    # calculate corr between left and right cheek
+    region_corr["lr"] = calc_correlation(
+        filtered_signals["left_cheek"],
+        filtered_signals["right_cheek"],
+        CORR_WINDOW,
+        CORR_STEP
+    )
+
+    # calculate corr between left cheek and forehead
+    region_corr["lf"] = calc_correlation(
+        filtered_signals["left_cheek"],
+        filtered_signals["forehead"],
+        CORR_WINDOW,
+        CORR_STEP
+    )
+
+    print(f"Region correlation, left-right: {region_corr["lr"]} \n" 
+          f"Region correlation, left-forehead: {region_corr["lf"]}")
+    
+    print(f"Mean for left cheek signal: {np.mean(filtered_signals["left_cheek"])} \n",
+        f"Mean for right cheek signal: {np.mean(filtered_signals["right_cheek"])}")
+    
+    # calc phase coherence
+    region_phase = {}
+
+    region_phase["lr"] = phase_coherence(
+        filtered_signals["left_cheek"],
+        filtered_signals["right_cheek"],
+        WINDOW_SIZE,
+        STEP_SIZE
+    )
+
+    region_phase["lf"] = phase_coherence(
+        filtered_signals["left_cheek"],
+        filtered_signals["forehead"],
+        WINDOW_SIZE,
+        STEP_SIZE
+    )
+
+    print("Phase coherence LR:", region_phase["lr"])
+    print("Phase coherence LF:", region_phase["lf"])
+
+
     hr_per_region = {}
     quality_per_region = {}
     for name, sig in filtered_signals.items():
@@ -273,7 +398,7 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
 
     return avg_hr, smooth_avg_hr
 
-# Run the pipeline
+# run the pipeline
 if __name__ == "__main__":
     avg_hr, smooth_avg_hr = process_video(video_path, video_landmarker, output_path, annotate=True)
     export_hr(avg_hr, smooth_avg_hr, filepath='data/heart_rate.csv')
