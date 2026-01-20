@@ -1,5 +1,6 @@
 import os
 import cv2
+import json
 import logging
 import numpy as np
 import pandas as pd
@@ -13,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 # paths
 model_path = os.path.join("data", "face_landmarker.task")
-video_path = r"data\train_sample_videos\abarnvbtwb.mp4"
 output_path = "data/annotated.mp4"
 
 # MediaPipe setup
@@ -21,16 +21,6 @@ BaseOptions = python.BaseOptions
 FaceLandmarker = vision.FaceLandmarker
 FaceLandmarkerOptions = vision.FaceLandmarkerOptions
 VisionRunningMode = vision.RunningMode
-
-video_options = FaceLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=model_path),
-    running_mode=VisionRunningMode.VIDEO,
-    output_face_blendshapes=True,
-    output_facial_transformation_matrixes=True,
-    num_faces=1
-)
-
-video_landmarker = FaceLandmarker.create_from_options(video_options)
 
 # regions to track
 REGIONS = ["forehead", "left_cheek", "right_cheek", "mid_region"]
@@ -57,7 +47,10 @@ def sliding_window_segments(signal, window_size, step_size):
     return segments
 
 def normalize_signal(signal):
-    return (signal - np.mean(signal)) / np.std(signal)
+    std = np.std(signal)
+    if std == 0:
+        return signal
+    return (signal - np.mean(signal)) / std
 
 def bandpass_filter(signal, fps, low=0.7, high=4.0):
     """
@@ -216,19 +209,116 @@ def phase_coherence(sig1, sig2, window, step):
             "mean_plv": np.mean(plv_list),
             "plv_variance": np.var(plv_list)
         }
+
+def extract_window_features(signal, fps, window_sec=1.6, step_sec=0.8):
+    """
+    extract window-level features per video
+    """
+    # extract features per window
+    WINDOW_SEC = 1.6
+    STEP_SEC = 0.8
+
+    WIN = int(WINDOW_SEC * fps)
+    STEP = int(STEP_SEC * fps)
+
+    window_features = []
+
+    # choose reference signals
+    left = signal["left_cheek"]
+    right = signal["right_cheek"]
+    forehead = signal["forehead"]
+
+    for start in range(0, len(left) - WIN + 1, STEP):
+        end = start + WIN
+
+        l = left[start:end]
+        r = right[start:end]
+        f = forehead[start:end]
+
+        # skip degenerate windows
+        if np.std(l) == 0 or np.std(r) == 0 or np.std(f) == 0:
+            continue
+
+        # calculate heart rate
+        hr = calc_heart_rate(l, fps)
+
+        # calc correlation
+        corr_lr = np.corrcoef(l, r)[0, 1]
+        corr_lf = np.corrcoef(l, f)[0, 1]
+
+        # phase coherence
+        plv_lr = np.abs(np.mean(np.exp(1j * (extract_phase(l) - extract_phase(r)))))
+        plv_lf = np.abs(np.mean(np.exp(1j * (extract_phase(l) - extract_phase(f)))))
+
+        # stability
+        std_l = np.std(l)
+        std_r = np.std(r)
+        std_f = np.std(f)
+
+        window_features.append({
+            "hr": hr,
+            "corr_lr": corr_lr,
+            "corr_lf": corr_lf,
+            "plv_lr": plv_lr,
+            "plv_lf": plv_lf,
+            "std_left": std_l,
+            "std_right": std_r,
+            "std_forehead": std_f
+        })
+
+    return window_features
+
+def aggregate_features(metadata, window_features, video_name):
+    """
+    aggregate window-level features into video features for ml prediction
+    open metadata.json
+    get video name and labels, append to features
+    """
+    if len(window_features) == 0:
+        return None
     
-def process_video(video_path, landmarker, output_path=None, annotate=True):
+    df = pd.DataFrame(window_features)
+    video_features = {}
+
+    for col in df.columns:
+        values = df[col].dropna().values
+        if len(values) == 0:
+            continue
+        
+        video_features["video_name"] = video_name
+        video_features[f"{col}_mean"] = np.mean(values)
+        video_features[f"{col}_std"] = np.std(values)
+        video_features[f"{col}_min"] = np.min(values)
+        video_features[f"{col}_max"] = np.max(values)
+        video_features[f"{col}_median"] = np.median(values)
+        video_features["label"] = 1 if metadata[video_name]["label"] == "REAL" else 0
+
+    return video_features
+
+def process_video(metadata, video_path, video_name, output_path=None, annotate=True):
     """process a video to compute HR from face regions and optionally save annotated video."""
+
+    video_options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.VIDEO,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=True,
+        num_faces=1
+    )
+
+    landmarker = FaceLandmarker.create_from_options(video_options)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error("Cannot load video")
-        return
+        return None, None, None
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     timestamp_ms = 0
+    frame_idx = 0
+    frame_duration_ms = 1000 / fps
 
     out = None
     if annotate and output_path:
@@ -243,6 +333,9 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
         ret, frame = cap.read()
         if not ret:
             break
+
+        timestamp_ms = int(round(frame_idx * frame_duration_ms))
+        frame_idx += 1
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -276,14 +369,13 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
                 else:
                     signals[name].append(signals[name][-1] if signals[name] else [0,0,0])
 
+        # show annotated video in gui
         if annotate:
             cv2.imshow("Annotated Video", annotated_frame)
             if out:
                 out.write(annotated_frame)
             if cv2.waitKey(int(1000/fps)) & 0xFF == 27:
                 break
-
-        timestamp_ms += int(1000/fps)
 
     cap.release()
     if out:
@@ -299,6 +391,17 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
         green = detrend(green)
         green = bandpass_filter(green, fps)
         filtered_signals[name] = green
+
+    # extract window-level functions
+    window_features = extract_window_features(filtered_signals, fps)
+    print(f"Extracted {len(window_features)} window-level feature vectors from video")
+
+    # aggregate to video-level features
+    video_features = aggregate_features(metadata, window_features, video_name)
+    print("Video features have been extracted")
+    
+    for k, v in video_features.items():
+        print(f"{k}: {v}")
 
     # calculate signal correlation between face regions
     region_corr = {}
@@ -323,11 +426,11 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
         CORR_STEP
     )
 
-    print(f"Region correlation, left-right: {region_corr["lr"]} \n" 
-          f"Region correlation, left-forehead: {region_corr["lf"]}")
+    print(f"Region correlation, left-right: {region_corr['lr']} \n" 
+          f"Region correlation, left-forehead: {region_corr['lf']}")
     
-    print(f"Mean for left cheek signal: {np.mean(filtered_signals["left_cheek"])} \n",
-        f"Mean for right cheek signal: {np.mean(filtered_signals["right_cheek"])}")
+    print(f"Mean for left cheek signal: {np.mean(filtered_signals['left_cheek'])} \n",
+          f"Mean for right cheek signal: {np.mean(filtered_signals['right_cheek'])}")
     
     # calc phase coherence
     region_phase = {}
@@ -349,7 +452,7 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
     print("Phase coherence LR:", region_phase["lr"])
     print("Phase coherence LF:", region_phase["lf"])
 
-
+    # calc heart region per face region, and their quality
     hr_per_region = {}
     quality_per_region = {}
     for name, sig in filtered_signals.items():
@@ -382,7 +485,9 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
     df_quality.to_csv('data/heart_rate_quality.csv', index=False)
     print("Saved heart rate signal quality metrics to data/hr_quality.csv")
 
-    if len(avg_hr) > 0:
+    # plot raw vs smoothed hr
+    """
+        if len(avg_hr) > 0:
         plt.figure(figsize=(10,4))
         plt.plot(avg_hr, label="Raw HR", marker='o')
         plt.plot(range(len(smooth_avg_hr)), smooth_avg_hr, label="Smoothed HR", linewidth=2, marker='x')
@@ -395,10 +500,36 @@ def process_video(video_path, landmarker, output_path=None, annotate=True):
         print(f"Estimated average HR: {np.mean(avg_hr):.2f} bpm")
     else:
         print("No HR could be estimated")
-
-    return avg_hr, smooth_avg_hr
+    """
+    return avg_hr, smooth_avg_hr, video_features
 
 # run the pipeline
 if __name__ == "__main__":
-    avg_hr, smooth_avg_hr = process_video(video_path, video_landmarker, output_path, annotate=True)
-    export_hr(avg_hr, smooth_avg_hr, filepath='data/heart_rate.csv')
+
+    with open(r"data\train_sample_videos\metadata.json", "r") as f:
+        metadata = json.load(f)
+
+    video_dir = r"data\train_sample_videos"
+    video_names = list(metadata.keys())[0:1]
+
+    all_video_features = []
+
+    for video_name in video_names:
+        video_path = os.path.join(video_dir, video_name)
+
+        avg_hr, smooth_avg_hr, video_features = process_video(
+            metadata, 
+            video_path,
+            video_name,
+            output_path=None,
+            annotate=True
+        )
+
+        if video_features is not None:
+            all_video_features.append(video_features)
+
+    df = pd.DataFrame(all_video_features)
+    df.to_csv("data/video_features.csv", index=False)
+
+    print("Saved video-level features")
+
