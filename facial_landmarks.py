@@ -2,6 +2,7 @@ import os
 import cv2
 import json
 import logging
+import traceback
 import numpy as np
 import pandas as pd
 import mediapipe as mp
@@ -55,12 +56,37 @@ def normalize_signal(signal):
 def bandpass_filter(signal, fps, low=0.7, high=4.0):
     """
     use butterworth bandpass to filter through freqs
+    handles short signals gracefully for deepfake detection
     """
+    # for very short signals, just return centered signal
+    if len(signal) < 10:
+        return signal - np.mean(signal)
+    
     nyquist = 0.5 * fps
     low_cut = low / nyquist
     high_cut = high / nyquist
-    b, a = butter(N=3, Wn=[low_cut, high_cut], btype='band')
-    return filtfilt(b, a, signal)
+    
+    # ensure cutoff frequencies are valid
+    if low_cut <= 0 or low_cut >= 1 or high_cut <= 0 or high_cut >= 1:
+        return signal - np.mean(signal)
+    
+    try:
+        b, a = butter(N=3, Wn=[low_cut, high_cut], btype='band')
+        
+        # calculate safe padlen based on signal length
+        default_padlen = 3 * max(len(a), len(b))
+        safe_padlen = min(default_padlen, len(signal) - 1)
+        
+        if safe_padlen < 1:
+            # signal too short for any padding
+            return signal - np.mean(signal)
+        
+        return filtfilt(b, a, signal, padlen=safe_padlen)
+        
+    except ValueError as e:
+        # if filtering still fails, return centered signal
+        logger.warning(f"Bandpass filter failed for signal of length {len(signal)}: {e}")
+        return signal - np.mean(signal)
 
 def calc_heart_rate(signal, fps, hr_min=40, hr_max=180):
     """
@@ -213,14 +239,29 @@ def phase_coherence(sig1, sig2, window, step):
 def extract_window_features(signal, fps, window_sec=1.6, step_sec=0.8):
     """
     extract window-level features per video
+    handles short videos by shortening window size
     """
-    # extract features per window
+    # Get signal lengths
+    signal_lengths = [len(sig) for sig in signal.values()]
+    min_signal_length = min(signal_lengths) if signal_lengths else 0
+    
+    if min_signal_length < 10:
+        logger.warning(f"Signal too short ({min_signal_length} frames) for window extraction")
+        return []
+    
+    # Adjust window size for short videos
     WINDOW_SEC = 1.6
     STEP_SEC = 0.8
-
+    
     WIN = int(WINDOW_SEC * fps)
     STEP = int(STEP_SEC * fps)
-
+    
+    # If signal is shorter than window, use smaller window
+    if min_signal_length < WIN:
+        WIN = max(10, min_signal_length // 2)  # Use half the signal or minimum 10 frames
+        STEP = max(5, WIN // 2)  # Step is half the window
+        logger.warning(f"Adjusted window size to {WIN} frames for short video")
+    
     window_features = []
 
     # choose reference signals
@@ -243,12 +284,16 @@ def extract_window_features(signal, fps, window_sec=1.6, step_sec=0.8):
         hr = calc_heart_rate(l, fps)
 
         # calc correlation
-        corr_lr = np.corrcoef(l, r)[0, 1]
-        corr_lf = np.corrcoef(l, f)[0, 1]
+        corr_lr = np.corrcoef(l, r)[0, 1] if len(l) > 1 else 0.0
+        corr_lf = np.corrcoef(l, f)[0, 1] if len(l) > 1 else 0.0
 
         # phase coherence
-        plv_lr = np.abs(np.mean(np.exp(1j * (extract_phase(l) - extract_phase(r)))))
-        plv_lf = np.abs(np.mean(np.exp(1j * (extract_phase(l) - extract_phase(f)))))
+        try:
+            plv_lr = np.abs(np.mean(np.exp(1j * (extract_phase(l) - extract_phase(r)))))
+            plv_lf = np.abs(np.mean(np.exp(1j * (extract_phase(l) - extract_phase(f)))))
+        except:
+            plv_lr = 0.0
+            plv_lf = 0.0
 
         # stability
         std_l = np.std(l)
@@ -265,39 +310,76 @@ def extract_window_features(signal, fps, window_sec=1.6, step_sec=0.8):
             "std_right": std_r,
             "std_forehead": std_f
         })
+    
+    # If no windows were extracted, create at least one from the entire signal
+    if len(window_features) == 0 and len(left) >= 5:
+        logger.warning("No windows extracted, using entire signal as single window")
+        try:
+            hr = calc_heart_rate(left, fps)
+            corr_lr = np.corrcoef(left, right)[0, 1] if len(left) > 1 else 0.0
+            corr_lf = np.corrcoef(left, forehead)[0, 1] if len(left) > 1 else 0.0
+            
+            window_features.append({
+                "hr": hr if hr is not None else 0.0,
+                "corr_lr": corr_lr,
+                "corr_lf": corr_lf,
+                "plv_lr": 0.0,
+                "plv_lf": 0.0,
+                "std_left": np.std(left),
+                "std_right": np.std(right),
+                "std_forehead": np.std(forehead)
+            })
+        except Exception as e:
+            logger.error(f"Failed to create fallback window: {e}")
 
     return window_features
 
 def aggregate_features(metadata, window_features, video_name):
     """
     aggregate window-level features into video features for ml prediction
-    open metadata.json
-    get video name and labels, append to features
+    Handles cases with no window features by using default values
     """
+    video_features = {
+        "video_name": video_name,
+        "label": 1 if metadata[video_name]["label"] == "REAL" else 0
+    }
+    
     if len(window_features) == 0:
-        return None
+        logger.warning(f"No window features for {video_name}. Using default values.")
+        # Add default features for videos that couldn't be processed
+        default_cols = ["hr", "corr_lr", "corr_lf", "plv_lr", "plv_lf", 
+                       "std_left", "std_right", "std_forehead"]
+        for col in default_cols:
+            video_features[f"{col}_mean"] = 0.0
+            video_features[f"{col}_std"] = 0.0
+            video_features[f"{col}_min"] = 0.0
+            video_features[f"{col}_max"] = 0.0
+            video_features[f"{col}_median"] = 0.0
+        return video_features
     
     df = pd.DataFrame(window_features)
-    video_features = {}
 
     for col in df.columns:
         values = df[col].dropna().values
         if len(values) == 0:
-            continue
-        
-        video_features["video_name"] = video_name
-        video_features[f"{col}_mean"] = np.mean(values)
-        video_features[f"{col}_std"] = np.std(values)
-        video_features[f"{col}_min"] = np.min(values)
-        video_features[f"{col}_max"] = np.max(values)
-        video_features[f"{col}_median"] = np.median(values)
-        video_features["label"] = 1 if metadata[video_name]["label"] == "REAL" else 0
+            # If all values are NaN, use 0
+            video_features[f"{col}_mean"] = 0.0
+            video_features[f"{col}_std"] = 0.0
+            video_features[f"{col}_min"] = 0.0
+            video_features[f"{col}_max"] = 0.0
+            video_features[f"{col}_median"] = 0.0
+        else:
+            video_features[f"{col}_mean"] = np.mean(values)
+            video_features[f"{col}_std"] = np.std(values)
+            video_features[f"{col}_min"] = np.min(values)
+            video_features[f"{col}_max"] = np.max(values)
+            video_features[f"{col}_median"] = np.median(values)
 
     return video_features
 
 def process_video(metadata, video_path, video_name, output_path=None, annotate=True):
     """process a video to compute HR from face regions and optionally save annotated video."""
-
+    
     video_options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=VisionRunningMode.VIDEO,
@@ -305,20 +387,24 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
         output_facial_transformation_matrixes=True,
         num_faces=1
     )
-
     landmarker = FaceLandmarker.create_from_options(video_options)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        logger.error("Cannot load video")
-        return None, None, None
+        logger.error(f"Cannot load video: {video_path}")
+        # return default features even if video can't be opened
+        default_features = {
+            "video_name": video_name,
+            "label": 1 if metadata[video_name]["label"] == "REAL" else 0
+        }
+        return None, None, default_features
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    timestamp_ms = 0
+    
     frame_idx = 0
-    frame_duration_ms = 1000 / fps
+    frame_duration_ms = 1000.0 / fps
 
     out = None
     if annotate and output_path:
@@ -326,7 +412,7 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
                               cv2.VideoWriter_fourcc(*'mp4v'),
                               fps, (frame_width, frame_height))
 
-    # Initialize signals per region
+    # init signals per region
     signals = {region: [] for region in REGIONS}
 
     while cap.isOpened():
@@ -346,13 +432,11 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
         if result.face_landmarks and len(result.face_landmarks) > 0:
             face_landmarks = result.face_landmarks[0]
 
-            # Wrap in object if list (fixes AttributeError)
             if isinstance(face_landmarks, list):
                 class Temp:
                     landmark = face_landmarks
                 face_landmarks = Temp()
 
-            # Draw landmarks & regions if annotate
             if annotate:
                 h, w = frame.shape[:2]
                 regions = get_regions(face_landmarks, h, w)
@@ -360,7 +444,6 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
                     for x, y in points:
                         cv2.circle(annotated_frame, (x, y), 2, (0,255,0), -1)
 
-            # Extract mean RGB per region
             regions = get_regions(face_landmarks, frame_height, frame_width)
             for name, pts in regions.items():
                 mean_rgb = extract_mean_values(frame, pts)
@@ -369,7 +452,6 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
                 else:
                     signals[name].append(signals[name][-1] if signals[name] else [0,0,0])
 
-        # show annotated video in gui
         if annotate:
             cv2.imshow("Annotated Video", annotated_frame)
             if out:
@@ -381,27 +463,37 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
     if out:
         out.release()
     cv2.destroyAllWindows()
+    landmarker.close()
 
-    # Process signals per region
+    # process signals per region
     filtered_signals = {}
     for name, sig in signals.items():
+        if len(sig) < 5:  # need at least 5 frames
+            logger.warning(f"Signal {name} too short ({len(sig)} frames) for {video_name}")
+            continue
+            
         arr = np.array(sig)
         green = arr[:, 1]
         green = normalize_signal(green)
         green = detrend(green)
-        green = bandpass_filter(green, fps)
+        green = bandpass_filter(green, fps)  # now handle short signals
         filtered_signals[name] = green
 
-    # extract window-level functions
-    window_features = extract_window_features(filtered_signals, fps)
+    # always try to extract features, even if limited
+    window_features = extract_window_features(filtered_signals, fps) if len(filtered_signals) >= 2 else []
     print(f"Extracted {len(window_features)} window-level feature vectors from video")
 
-    # aggregate to video-level features
+    # always aggregate to video-level features
     video_features = aggregate_features(metadata, window_features, video_name)
     print("Video features have been extracted")
     
     for k, v in video_features.items():
         print(f"{k}: {v}")
+
+    # skip detailed metrics for very short videos
+    if len(filtered_signals) < 2:
+        logger.warning(f"Skipping detailed metrics for {video_name}, short video and insufficient features")
+        return None, None, video_features
 
     # calculate signal correlation between face regions
     region_corr = {}
@@ -503,33 +595,62 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
     """
     return avg_hr, smooth_avg_hr, video_features
 
-# run the pipeline
 if __name__ == "__main__":
 
     with open(r"data\train_sample_videos\metadata.json", "r") as f:
         metadata = json.load(f)
 
     video_dir = r"data\train_sample_videos"
-    video_names = list(metadata.keys())[0:1]
+    video_names = list(metadata.keys())[:10]
 
     all_video_features = []
-
-    for video_name in video_names:
+    
+    for i, video_name in enumerate(video_names, 1):
+        print(f"\n{'='*60}")
+        print(f"Processing video {i}/{len(video_names)}: {video_name}")
+        print(f"{'='*60}")
+        
         video_path = os.path.join(video_dir, video_name)
+        
+        try:
+            avg_hr, smooth_avg_hr, video_features = process_video(
+                metadata, 
+                video_path,
+                video_name,
+                output_path=None,
+                annotate=False 
+            )
 
-        avg_hr, smooth_avg_hr, video_features = process_video(
-            metadata, 
-            video_path,
-            video_name,
-            output_path=None,
-            annotate=True
-        )
+            # ALWAYS append features
+            if video_features is not None:
+                all_video_features.append(video_features)
+                print(f"Successfully processed {video_name}")
+            else:
+                print(f"Warning: video_features is None for {video_name}")
+                
+        except Exception as e:
+            print(f"Error processing {video_name}: {e}")
+            traceback.print_exc()
+            
+            # create minimal default features for crashed videos
+            try:
+                default_features = {
+                    "video_name": video_name,
+                    "label": 1 if metadata[video_name]["label"] == "REAL" else 0
+                }
+                all_video_features.append(default_features)
+            except:
+                pass
+            continue
 
-        if video_features is not None:
-            all_video_features.append(video_features)
-
-    df = pd.DataFrame(all_video_features)
-    df.to_csv("data/video_features.csv", index=False)
-
-    print("Saved video-level features")
+    if all_video_features:
+        df = pd.DataFrame(all_video_features)
+        # fill nan values with 0
+        df = df.fillna(0)
+        df.to_csv("data/video_features.csv", index=False)
+        print(f"Saved {len(all_video_features)} video-level features")
+        print(f"  File: data/video_features.csv")
+        print(f"{'='*60}")
+    else:
+        print("\nNo videos were successfully processed")
 
