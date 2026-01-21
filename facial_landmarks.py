@@ -518,11 +518,13 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
         CORR_STEP
     )
 
+    """
     print(f"Region correlation, left-right: {region_corr['lr']} \n" 
-          f"Region correlation, left-forehead: {region_corr['lf']}")
+        f"Region correlation, left-forehead: {region_corr['lf']}")
     
     print(f"Mean for left cheek signal: {np.mean(filtered_signals['left_cheek'])} \n",
           f"Mean for right cheek signal: {np.mean(filtered_signals['right_cheek'])}")
+    """
     
     # calc phase coherence
     region_phase = {}
@@ -541,8 +543,10 @@ def process_video(metadata, video_path, video_name, output_path=None, annotate=T
         STEP_SIZE
     )
 
+    """
     print("Phase coherence LR:", region_phase["lr"])
     print("Phase coherence LF:", region_phase["lf"])
+    """
 
     # calc heart region per face region, and their quality
     hr_per_region = {}
@@ -601,7 +605,7 @@ if __name__ == "__main__":
         metadata = json.load(f)
 
     video_dir = r"data\train_sample_videos"
-    video_names = list(metadata.keys())[:10]
+    video_names = list(metadata.keys())[:400]
 
     all_video_features = []
     
@@ -621,7 +625,7 @@ if __name__ == "__main__":
                 annotate=False 
             )
 
-            # ALWAYS append features
+            # always append features
             if video_features is not None:
                 all_video_features.append(video_features)
                 print(f"Successfully processed {video_name}")
